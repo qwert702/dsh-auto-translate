@@ -1,0 +1,6 @@
+# dsh-auto-translate profile patch (activated via dsh.bundle once installed):
+# the client rides the additive `conversation.chat.turnTail` chain seat, so
+# nothing in the stock composition is replaced or disabled.
+- insert:
+    - id: ui-auto-translate
+      name: 'dsh-auto-translate'

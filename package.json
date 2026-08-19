@@ -1,0 +1,33 @@
+{
+  "name": "dsh-auto-translate",
+  "version": "0.1.0",
+  "description": "Auto-translate for the DeepSeek Harness Web GUI: when the assistant's reply is in English, a Chinese translation appears below the turn; each tool call in the turn gets a one-line Chinese gloss. The translation is a standalone provider call that never enters the session transcript.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "dsh-auto-translate.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node test/smoke.cjs"
+  },
+  "license": "MIT"
+}
