@@ -4,10 +4,9 @@
 //    route; the handler reads settings, resolves the API key, proxies a
 //    standalone provider request (ok / disabled / bad-request / empty /
 //    no-api-key / provider-error-with-fallback-model / summarize-mode paths).
-// 3. Client bundle: the two shadow registrations on conversation.chat.node
-//    (assistant-step and tool-call at priority -100, the tool-call entry
-//    re-declaring the tool.call.toolview child slot), plus SSR renders of the
-//    shadow renderers over mock conversation nodes.
+// 3. Client bundle: the assistant-step shadow registration (priority -100)
+//    plus the additive turnTail chain entry, and SSR renders of the shadow
+//    renderer and the tool-summary tail over mock conversation nodes.
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -233,7 +232,7 @@ function clientTests() {
     throw new Error('wrong client inject: ' + JSON.stringify(client.inject));
   }
 
-  // registration assertions: two shadow entries on conversation.chat.node
+  // registration assertions: assistant-step shadow + turnTail chain entry
   const entries = [];
   const injectedKeys = [];
   const ctx = {
@@ -252,26 +251,66 @@ function clientTests() {
     },
   };
   client.apply(ctx);
-  if (injectedKeys.length !== 2 || injectedKeys.some((k) => k !== 'conversation.chat.node')) {
-    throw new Error('wrong injected slot keys: ' + JSON.stringify(injectedKeys));
+  const nodeEntries = entries.filter((e) => e.opts.name === 'conversation.chat.node');
+  const tailEntries = entries.filter((e) => e.opts.name === 'conversation.chat.turnTail');
+  if (nodeEntries.length !== 1) throw new Error('expected one chat.node entry, got ' + nodeEntries.length);
+  if (tailEntries.length !== 1) throw new Error('expected one turnTail entry, got ' + tailEntries.length);
+  const assistant = nodeEntries[0];
+  if (assistant.opts.key !== 'assistant-step') throw new Error('wrong shadow key: ' + assistant.opts.key);
+  if (assistant.opts.priority !== -100) throw new Error('shadow priority must be -100: ' + assistant.opts.priority);
+  if (assistant.component !== client.TranslateAssistantNodeView) throw new Error('shadow component mismatch');
+  const tail = tailEntries[0];
+  if (tail.opts.id !== 'auto-translate') throw new Error('wrong turnTail id');
+  const matched = tail.opts.select({ turn: 3, seq: 7 });
+  if (matched.turn !== 3 || matched.seq !== 7) throw new Error('turnTail select wrong: ' + JSON.stringify(matched));
+  if (tail.component !== client.TurnTranslateTail) throw new Error('turnTail component mismatch');
+  console.log('OK: client shadows assistant-step (priority -100) + turnTail chain entry');
+
+  // collectTurnTools: pairs assistant-step tool-call blocks with settled roots
+  const snapshot = {
+    chat: {
+      locations: { getTurn: (turn) => ['k1', 'k2'] },
+      nodes: {
+        get: (key) => {
+          if (key === 'k1') {
+            return {
+              key,
+              kind: 'tool-call',
+              data: {
+                root: {
+                  callId: 'call-1',
+                  kind: 'tool-result',
+                  call: { name: 'bash', argsRaw: '{"command":"ls"}' },
+                  content: [{ type: 'text', text: 'hello.txt' }],
+                  isError: false,
+                  subCalls: [],
+                },
+              },
+            };
+          }
+          return {
+            key,
+            kind: 'assistant-step',
+            data: {
+              blocks: [
+                { kind: 'tool-call', callId: 'call-2', name: 'web_search', argsRaw: '{}' },
+                { kind: 'tool-call', callId: 'call-1', name: 'bash', argsRaw: '{}' },
+              ],
+            },
+          };
+        },
+      },
+    },
+  };
+  const tools = client.collectTurnTools(snapshot, 1);
+  const byId = Object.fromEntries(tools.map((t) => [t.callId, t]));
+  if (byId['call-1'] === undefined || byId['call-1'].name !== 'bash' || byId['call-1'].output !== 'hello.txt') {
+    throw new Error('collectTurnTools call-1 wrong: ' + JSON.stringify(tools));
   }
-  if (entries.length !== 2) throw new Error('expected two entries, got ' + entries.length);
-  const byKey = Object.fromEntries(entries.map((e) => [e.opts.key, e]));
-  const assistant = byKey['assistant-step'];
-  const tool = byKey['tool-call'];
-  if (assistant === undefined || tool === undefined) {
-    throw new Error('missing shadow keys: ' + Object.keys(byKey).join(','));
+  if (byId['call-2'] === undefined || byId['call-2'].name !== 'web_search' || byId['call-2'].output !== '') {
+    throw new Error('collectTurnTools call-2 wrong: ' + JSON.stringify(tools));
   }
-  if (assistant.opts.priority !== -100 || tool.opts.priority !== -100) {
-    throw new Error('shadow priority must be -100: ' + JSON.stringify(entries.map((e) => e.opts.priority)));
-  }
-  if (assistant.component !== client.TranslateAssistantNodeView) throw new Error('assistant component mismatch');
-  if (tool.component !== client.TranslateToolCallTree) throw new Error('tool component mismatch');
-  const childSlot = tool.opts.children?.['tool.call.toolview'];
-  if (childSlot === undefined || childSlot.kind !== 'keyed' || childSlot.scope !== 'session') {
-    throw new Error('tool-call entry must re-declare tool.call.toolview: ' + JSON.stringify(tool.opts.children));
-  }
-  console.log('OK: client shadows assistant-step + tool-call at priority -100 (toolview child re-declared)');
+  console.log('OK: collectTurnTools pairs tool-call roots with assistant blocks');
 
   // SSR render: settled assistant step with reasoning + text + tool-call blocks
   const renderer = require(path.join(harnessModules, 'react-dom/server'));
@@ -316,32 +355,13 @@ function clientTests() {
   if (!runningHtml.includes('Thinking…')) throw new Error('streaming reasoning not rendered');
   console.log('OK: assistant-step SSR handles the streaming state');
 
-  // SSR render: settled tool call tree with a text output
-  const toolNode = {
-    key: 'tool:1',
-    data: {
-      root: {
-        callId: 'call-1',
-        kind: 'tool-result',
-        call: { name: 'bash', argsRaw: '{"command":"ls"}' },
-        content: [{ type: 'text', text: 'hello.txt' }],
-        isError: false,
-        subCalls: [],
-      },
-    },
-  };
-  const toolHtml = renderer.renderToString(react.createElement(client.TranslateToolCallTree, {
-    node: toolNode,
-    renderSlot: (key, owner, opts) => (opts?.fallback ?? null),
-    selectedCallId: undefined,
-    cwd: undefined,
-    openFile: undefined,
-    inspectCall: () => {},
+  // SSR render: turnTail with one settled tool -> tool gloss line renders
+  const tailHtml = renderer.renderToString(react.createElement(client.TurnTranslateTail, {
+    matched: { turn: 1, seq: 5 },
+    useSession: (sel) => sel(snapshot),
   }));
-  if (!toolHtml.includes('call-1')) throw new Error('tool call id not rendered');
-  if (!toolHtml.includes('hello.txt')) throw new Error('tool output text not rendered');
-  if (!toolHtml.includes('执行 shell 命令')) throw new Error('tool gloss not rendered');
-  console.log('OK: tool-call SSR renders the simplified card with gloss + output');
+  if (!tailHtml.includes('bash — 执行 shell 命令')) throw new Error('tool gloss not rendered');
+  console.log('OK: turnTail SSR renders the tool gloss line');
 }
 
 async function main() {
