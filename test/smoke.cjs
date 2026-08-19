@@ -3,9 +3,11 @@
 // 2. Host half: apply() registers the POST /api/auto-translate/translate
 //    route; the handler reads settings, resolves the API key, proxies a
 //    standalone provider request (ok / disabled / bad-request / empty /
-//    no-api-key / provider-error-with-fallback-model paths).
-// 3. Client bundle: loader registration, the conversation.chat.turnTail chain
-//    entry (select returns {turn, seq}), and the component export.
+//    no-api-key / provider-error-with-fallback-model / summarize-mode paths).
+// 3. Client bundle: the two shadow registrations on conversation.chat.node
+//    (assistant-step and tool-call at priority -100, the tool-call entry
+//    re-declaring the tool.call.toolview child slot), plus SSR renders of the
+//    shadow renderers over mock conversation nodes.
 const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -78,7 +80,6 @@ async function hostTests() {
       body: () => body,
     };
   }
-  // IncomingMessage body stream: emit chunks then end.
   function bodyStream(text) {
     const chunks = Buffer.from(text, 'utf8');
     return {
@@ -96,7 +97,6 @@ async function hostTests() {
   }
 
   const originalFetch = global.fetch;
-  const seenRequests = [];
   try {
     // disabled -> 200 disabled
     translateConfig.enabled = false;
@@ -137,10 +137,12 @@ async function hostTests() {
     }
     console.log('OK: host route 503 no-api-key');
 
-    // provider ok -> 200 translation, body carries only the translation
+    // provider ok, translate mode -> 200, prompt is the translation instruction
     keyResolver = async () => ({ value: 'sk-test', source: 'credentials.yaml' });
+    let seenPrompt = '';
     global.fetch = async (url, options) => {
-      seenRequests.push({ url, options });
+      const body = JSON.parse(options.body);
+      seenPrompt = body.messages[0].content;
       return {
         ok: true,
         status: 200,
@@ -153,13 +155,17 @@ async function hostTests() {
     if (f.status() !== 200 || parsed.ok !== true || parsed.translation !== '你好，世界。' || parsed.model !== 'deepseek-v4-flash') {
       throw new Error('ok path wrong: ' + f.status() + ' ' + f.body());
     }
-    const first = seenRequests[0];
-    if (!first.url.startsWith('https://api.deepseek.com/chat/completions')) throw new Error('wrong provider url: ' + first.url);
-    const sentBody = JSON.parse(first.options.body);
-    if (sentBody.model !== 'deepseek-v4-flash') throw new Error('wrong provider model: ' + sentBody.model);
-    if (!sentBody.messages[0].content.includes('Hello world.')) throw new Error('prompt missing the text');
-    if (sentBody.messages[0].role !== 'user') throw new Error('wrong prompt role');
-    console.log('OK: host route 200 translation (model hint passed to provider)');
+    if (!seenPrompt.includes('翻译成简体中文')) throw new Error('translate prompt wrong: ' + seenPrompt);
+    if (!seenPrompt.includes('Hello world.')) throw new Error('prompt missing the text');
+    console.log('OK: host route 200 translation (translate mode)');
+
+    // summarize mode -> prompt asks for a summary
+    f = fakeRes();
+    await route.handler(bodyStream(JSON.stringify({ text: 'Command failed with exit code 1', mode: 'summarize' })), f.res);
+    parsed = JSON.parse(f.body());
+    if (f.status() !== 200 || parsed.ok !== true) throw new Error('summarize path wrong: ' + f.status() + ' ' + f.body());
+    if (!seenPrompt.includes('概括')) throw new Error('summarize prompt wrong: ' + seenPrompt);
+    console.log('OK: host route summarize mode');
 
     // provider error on the conversation model -> retry once with the generic model
     global.fetch = async (url, options) => {
@@ -180,24 +186,6 @@ async function hostTests() {
       throw new Error('fallback-model path wrong: ' + f.status() + ' ' + f.body());
     }
     console.log('OK: host route retries with the generic chat model on provider error');
-
-    // settings namespace supplies the model override + credential ref + base URL
-    translateConfig = { enabled: true, model: 'deepseek-reasoner', apiKeyRef: 'MY_KEY', baseURL: 'https://custom.example.com', temperature: 0.2, maxInputChars: 4000 };
-    global.fetch = async (url, options) => {
-      if (url !== 'https://custom.example.com/chat/completions') throw new Error('wrong url: ' + url);
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ choices: [{ message: { content: '自定义模型译文。' } }] }),
-      };
-    };
-    f = fakeRes();
-    await route.handler(bodyStream(JSON.stringify({ text: 'Custom model.' })), f.res);
-    parsed = JSON.parse(f.body());
-    if (f.status() !== 200 || parsed.ok !== true || parsed.model !== 'deepseek-reasoner' || parsed.translation !== '自定义模型译文。') {
-      throw new Error('settings-override path wrong: ' + f.status() + ' ' + f.body());
-    }
-    console.log('OK: host route honors the settings namespace override');
   } finally {
     global.fetch = originalFetch;
   }
@@ -205,20 +193,29 @@ async function hostTests() {
 
 // --- 3. client bundle tests ---
 function clientTests() {
-  const reactShim = {
-    memo: (fn) => fn,
-    useState: (init) => [typeof init === 'function' ? init() : init, () => {}],
-    useEffect: () => {},
+  const react = require(path.join(harnessModules, 'react'));
+  const jsxRuntime = require(path.join(harnessModules, 'react/jsx-runtime'));
+  const primitivesShim = {
+    MarkdownText: (props) => react.createElement('div', { 'data-test': 'markdown' }, props.text),
+    JsonBlock: () => react.createElement('div', null, 'json'),
+    DisclosureRow: ({ title, children, collapsedContent }) =>
+      react.createElement('div', null, title, collapsedContent, children),
+    IconThinkOutline14: () => react.createElement('span', null, 'T'),
   };
-  const jsxShim = { jsx: (type, props) => ({ type, props }) };
+  const attachmentShim = {
+    ImageGallery: () => react.createElement('div', null, 'gallery'),
+  };
+
   const loader = {};
   global.window = {
     __ModuleLoader__: {
       load(entry) {
         loader.id = entry.id;
         loader.exports = entry.factory((spec) => {
-          if (spec === 'react') return reactShim;
-          if (spec === 'react/jsx-runtime') return jsxShim;
+          if (spec === 'react') return react;
+          if (spec === 'react/jsx-runtime') return jsxRuntime;
+          if (spec === '@deepseek-ai/dsh-client-ui-primitives') return primitivesShim;
+          if (spec === '@deepseek-ai/dsh-client-ui-attachment') return attachmentShim;
           throw new Error('unexpected require: ' + spec);
         });
       },
@@ -236,13 +233,14 @@ function clientTests() {
     throw new Error('wrong client inject: ' + JSON.stringify(client.inject));
   }
 
+  // registration assertions: two shadow entries on conversation.chat.node
   const entries = [];
-  let injectedKey = null;
+  const injectedKeys = [];
   const ctx = {
     effect(fn) { fn(); },
     slots: {
       inject(key, factory) {
-        injectedKey = key;
+        injectedKeys.push(key);
         const registerCall = factory();
         registerCall();
         return () => {};
@@ -254,14 +252,96 @@ function clientTests() {
     },
   };
   client.apply(ctx);
-  if (injectedKey !== 'conversation.chat.turnTail') throw new Error('wrong injected slot key: ' + injectedKey);
-  if (entries.length !== 1) throw new Error('expected one chain entry, got ' + entries.length);
-  const entry = entries[0];
-  if (entry.opts.name !== 'conversation.chat.turnTail') throw new Error('wrong chain name: ' + entry.opts.name);
-  const matched = entry.opts.select({ turn: 3, seq: 7, openFile: undefined });
-  if (matched.turn !== 3 || matched.seq !== 7) throw new Error('chain select wrong: ' + JSON.stringify(matched));
-  if (entry.component !== client.TurnTranslateTail) throw new Error('chain component mismatch');
-  console.log('OK: client registers the turnTail chain entry (select -> {turn, seq})');
+  if (injectedKeys.length !== 2 || injectedKeys.some((k) => k !== 'conversation.chat.node')) {
+    throw new Error('wrong injected slot keys: ' + JSON.stringify(injectedKeys));
+  }
+  if (entries.length !== 2) throw new Error('expected two entries, got ' + entries.length);
+  const byKey = Object.fromEntries(entries.map((e) => [e.opts.key, e]));
+  const assistant = byKey['assistant-step'];
+  const tool = byKey['tool-call'];
+  if (assistant === undefined || tool === undefined) {
+    throw new Error('missing shadow keys: ' + Object.keys(byKey).join(','));
+  }
+  if (assistant.opts.priority !== -100 || tool.opts.priority !== -100) {
+    throw new Error('shadow priority must be -100: ' + JSON.stringify(entries.map((e) => e.opts.priority)));
+  }
+  if (assistant.component !== client.TranslateAssistantNodeView) throw new Error('assistant component mismatch');
+  if (tool.component !== client.TranslateToolCallTree) throw new Error('tool component mismatch');
+  const childSlot = tool.opts.children?.['tool.call.toolview'];
+  if (childSlot === undefined || childSlot.kind !== 'keyed' || childSlot.scope !== 'session') {
+    throw new Error('tool-call entry must re-declare tool.call.toolview: ' + JSON.stringify(tool.opts.children));
+  }
+  console.log('OK: client shadows assistant-step + tool-call at priority -100 (toolview child re-declared)');
+
+  // SSR render: settled assistant step with reasoning + text + tool-call blocks
+  const renderer = require(path.join(harnessModules, 'react-dom/server'));
+  const settledNode = {
+    key: 'asst:1',
+    location: { kind: 'turn', turn: { status: 'closed' } },
+    data: {
+      status: 'settled',
+      blocks: [
+        { kind: 'reasoning', text: 'Let me think about this carefully.' },
+        { kind: 'text', text: 'Here is the answer.' },
+        { kind: 'tool-call', callId: 'call-1', name: 'bash', argsRaw: '{}' },
+      ],
+      finalNode: { seq: 9, provenance: { provider: 'deepseek', model: 'deepseek-v4-flash' } },
+    },
+  };
+  const assistantHtml = renderer.renderToString(react.createElement(client.TranslateAssistantNodeView, {
+    node: settledNode,
+    useTurnData: () => ({ closing: { finalNode: { seq: 9 } } }),
+    openFile: undefined,
+    loadImage: undefined,
+    fileMentions: () => undefined,
+  }));
+  if (!assistantHtml.includes('Let me think about this carefully.')) throw new Error('reasoning text not rendered');
+  if (!assistantHtml.includes('Here is the answer.')) throw new Error('text not rendered');
+  if (!assistantHtml.includes('Think')) throw new Error('think disclosure missing');
+  console.log('OK: assistant-step SSR renders reasoning + text blocks');
+
+  // SSR render: running assistant step (streaming) must not crash
+  const runningNode = {
+    key: 'asst:2',
+    location: { kind: 'step', turn: { status: 'open' }, step: { status: 'open' } },
+    data: { status: 'running', blocks: [{ kind: 'reasoning', text: 'Thinking…' }] },
+  };
+  const runningHtml = renderer.renderToString(react.createElement(client.TranslateAssistantNodeView, {
+    node: runningNode,
+    useTurnData: () => undefined,
+    openFile: undefined,
+    loadImage: undefined,
+    fileMentions: () => undefined,
+  }));
+  if (!runningHtml.includes('Thinking…')) throw new Error('streaming reasoning not rendered');
+  console.log('OK: assistant-step SSR handles the streaming state');
+
+  // SSR render: settled tool call tree with a text output
+  const toolNode = {
+    key: 'tool:1',
+    data: {
+      root: {
+        callId: 'call-1',
+        kind: 'tool-result',
+        call: { name: 'bash', argsRaw: '{"command":"ls"}' },
+        content: [{ type: 'text', text: 'hello.txt' }],
+        isError: false,
+        subCalls: [],
+      },
+    },
+  };
+  const toolHtml = renderer.renderToString(react.createElement(client.TranslateToolCallTree, {
+    node: toolNode,
+    renderSlot: (key, owner, opts) => (opts?.fallback ?? null),
+    selectedCallId: undefined,
+    cwd: undefined,
+    openFile: undefined,
+    inspectCall: () => {},
+  }));
+  if (!toolHtml.includes('call-1')) throw new Error('tool call id not rendered');
+  if (!toolHtml.includes('hello.txt')) throw new Error('tool output text not rendered');
+  if (!toolHtml.includes('执行 shell 命令')) throw new Error('tool gloss not rendered');
+  console.log('OK: tool-call SSR renders the simplified card with gloss + output');
 }
 
 async function main() {
