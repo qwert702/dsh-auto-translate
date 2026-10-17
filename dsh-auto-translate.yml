@@ -1,6 +1,19 @@
 # dsh-auto-translate profile patch (activated via dsh.bundle once installed):
-# the client rides the additive `conversation.chat.turnTail` chain seat, so
+# the client rides two additive/uikit seats owned by @deepseek-ai/dsh-client-ui-chat
+# — a priority -100 shadow of the keyed `conversation.chat.node` assistant-step
+# renderer, and one entry on the `conversation.chat.turnTail` list seat — so
 # nothing in the stock composition is replaced or disabled.
+#
+# 翻译配置（可选）走 0.2.0 的 profile 条目 config 通道：在 profile 补丁层里覆盖
+# 本条目即可，例如
+#   - id: ui-auto-translate
+#     config:
+#       enabled: true
+#       model: ''
+#       apiKeyRef: DEEPSEEK_API_KEY
+#       baseURL: https://api.deepseek.com
+#       temperature: 0.3
+#       maxInputChars: 4000
 - insert:
     - id: ui-auto-translate
       name: 'dsh-auto-translate'
